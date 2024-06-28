@@ -2,18 +2,30 @@
 
 In some cases, you may want to exclude specific files or directories from the analysis performed by CodiumAI PR-Agent. This can be useful, for example, when you have files that are generated automatically or files that shouldn't be reviewed, like vendored code.
 
-To ignore files or directories, edit the **[ignore.toml](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/ignore.toml)** configuration file. This setting also exposes the following environment variables:
-
+You can ignore files or folders using the following methods:
  - `IGNORE.GLOB`
  - `IGNORE.REGEX`
 
-For example, to ignore Python files in a PR with online usage, comment on a PR:
-`/review --ignore.glob=['*.py']`
+which you can edit to ignore files or folders based on glob or regex patterns.
 
-To ignore Python files in all PRs, set in a configuration file:
+### Example usage
+
+Let's look at an example where we want to ignore all files with `.py` extension from the analysis.
+
+To ignore Python files in a PR with online usage, comment on a PR:
+`/review --ignore.glob="['*.py']"`
+
+
+To ignore Python files in all PRs using `glob` pattern, set in a configuration file:
 ```
 [ignore]
 glob = ['*.py']
+```
+
+And to ignore Python files in all PRs using `regex` pattern, set in a configuration file:
+```
+[regex]
+regex = ['.*\.py$']
 ```
 
 ## Extra instructions

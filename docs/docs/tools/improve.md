@@ -59,6 +59,30 @@ auto_extended_mode=true
 Note that the extended mode divides the PR code changes into chunks, up to the token limits, where each chunk is handled separately (might use multiple calls to GPT-4 for large PRs).
 Hence, the total number of suggestions is proportional to the number of chunks, i.e., the size of the PR.
 
+### Self-review
+If you set in a configuration file:
+```
+[pr_code_suggestions]
+demand_code_suggestions_self_review = true
+```
+The `improve` tool will add a checkbox below the suggestions, prompting user to acknowledge that they have reviewed the suggestions.
+You can set the content of the checkbox text via:
+```
+[pr_code_suggestions]
+code_suggestions_self_review_text = "... (your text here) ..."
+```
+![self_review_1](https://codium.ai/images/pr_agent/self_review_1.png){width=512}
+
+💎 In addition, by setting:
+```
+[pr_code_suggestions]
+approve_pr_on_self_review = true
+```
+the tool can automatically approve the PR when the user checks the self-review checkbox.
+
+!!! tip "Demanding self-review from the PR author"
+  If you set the number of required reviewers for a PR to 2, this effectively means that the PR author must click the self-review checkbox before the PR can be merged (in addition to a human reviewer).
+  ![self_review_2](https://codium.ai/images/pr_agent/self_review_2.png){width=512}
 
 
 ## Configuration options
@@ -133,7 +157,7 @@ Hence, the total number of suggestions is proportional to the number of chunks, 
 
 !!! tip "Extra instructions"
 
-    Extra instructions are very important for the `imrpove` tool, since they enable you to guide the model to suggestions that are more relevant to the specific needs of the project.
+    Extra instructions are very important for the `improve` tool, since they enable you to guide the model to suggestions that are more relevant to the specific needs of the project.
     
     Be specific, clear, and concise in the instructions. With extra instructions, you are the prompter. Specify relevant aspects that you want the model to focus on.
     
@@ -166,6 +190,6 @@ Hence, the total number of suggestions is proportional to the number of chunks, 
     - Only if the `Category` header is relevant, the user should move to the summarized suggestion description
     - Only if the summarized suggestion description is relevant, the user should click on the collapsible, to read the full suggestion description with a code preview example.
 
-In addition, we recommend to use the `exra_instructions` field to guide the model to suggestions that are more relevant to the specific needs of the project. 
+In addition, we recommend to use the `extra_instructions` field to guide the model to suggestions that are more relevant to the specific needs of the project. 
 <br>
 Consider also trying the [Custom Prompt Tool](./custom_prompt.md) 💎, that will **only** propose code suggestions that follow specific guidelines defined by user.
