@@ -76,7 +76,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             litellm.AmazonAnthropicClaude3Config.max_tokens = 2000
             self.aws_bedrock_client = boto3.client(
                 service_name="bedrock-runtime",
-                region_name=get_settings().aws.bedrock_region,
+                region_name="us-east-1"
             )
 
     def prepare_logs(self, response, system, user, resp, finish_reason):
