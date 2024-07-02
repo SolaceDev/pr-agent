@@ -71,13 +71,19 @@ class LiteLLMAIHandler(BaseAiHandler):
             litellm.vertex_location = get_settings().get(
                 "VERTEXAI.VERTEX_LOCATION", None
             )
-        if get_settings().get("AWS.BEDROCK_REGION", None):
-            litellm.AmazonAnthropicConfig.max_tokens_to_sample = 2000
-            litellm.AmazonAnthropicClaude3Config.max_tokens = 2000
-            self.aws_bedrock_client = boto3.client(
-                service_name="bedrock-runtime",
-                region_name="us-east-1"
-            )
+        litellm.AmazonAnthropicConfig.max_tokens_to_sample = 2000
+        litellm.AmazonAnthropicClaude3Config.max_tokens = 2000
+        self.aws_bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name="us-east-1"
+        )
+        #if get_settings().get("AWS.BEDROCK_REGION", None):
+        #    litellm.AmazonAnthropicConfig.max_tokens_to_sample = 2000
+        #    litellm.AmazonAnthropicClaude3Config.max_tokens = 2000
+        #    self.aws_bedrock_client = boto3.client(
+        #        service_name="bedrock-runtime",
+        #        region_name="us-east-1"
+        #    )
 
     def prepare_logs(self, response, system, user, resp, finish_reason):
         response_log = response.dict().copy()
