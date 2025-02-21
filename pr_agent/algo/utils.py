@@ -1,32 +1,58 @@
 from __future__ import annotations
 
+import copy
 import difflib
+import hashlib
+import html
 import json
 import os
 import re
+import sys
 import textwrap
 import time
+import traceback
 from datetime import datetime
 from enum import Enum
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any, List, Tuple
 
+import html2text
+import requests
 import yaml
+from pydantic import BaseModel
 from starlette_context import context
 
 from pr_agent.algo import MAX_TOKENS
+from pr_agent.algo.git_patch_processing import extract_hunk_lines_from_patch
 from pr_agent.algo.token_handler import TokenEncoder
-from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.algo.types import FilePatchInfo
+from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.log import get_logger
+
+
+def get_weak_model() -> str:
+    if get_settings().get("config.model_weak"):
+        return get_settings().config.model_weak
+    return get_settings().config.model
+
+
+class Range(BaseModel):
+    line_start: int  # should be 0-indexed
+    line_end: int
+    column_start: int = -1
+    column_end: int = -1
 
 class ModelType(str, Enum):
     REGULAR = "regular"
-    TURBO = "turbo"
-
+    WEAK = "weak"
 
 class PRReviewHeader(str, Enum):
     REGULAR = "## PR Reviewer Guide"
     INCREMENTAL = "## Incremental PR Reviewer Guide"
+
+
+class PRDescriptionHeader(str, Enum):
+    CHANGES_WALKTHROUGH = "### **Changes walkthrough** 📝"
 
 
 def get_setting(key: str) -> Any:
@@ -37,7 +63,7 @@ def get_setting(key: str) -> Any:
         return global_settings.get(key, None)
 
 
-def emphasize_header(text: str) -> str:
+def emphasize_header(text: str, only_markdown=False, reference_link=None) -> str:
     try:
         # Finding the position of the first occurrence of ": "
         colon_position = text.find(": ")
@@ -45,7 +71,16 @@ def emphasize_header(text: str) -> str:
         # Splitting the string and wrapping the first part in <strong> tags
         if colon_position != -1:
             # Everything before the colon (inclusive) is wrapped in <strong> tags
-            transformed_string = "<strong>" + text[:colon_position + 1] + "</strong>" +'<br>' + text[colon_position + 1:]
+            if only_markdown:
+                if reference_link:
+                    transformed_string = f"[**{text[:colon_position + 1]}**]({reference_link})\n" + text[colon_position + 1:]
+                else:
+                    transformed_string = f"**{text[:colon_position + 1]}**\n" + text[colon_position + 1:]
+            else:
+                if reference_link:
+                    transformed_string = f"<strong><a href='{reference_link}'>{text[:colon_position + 1]}</a></strong><br>" + text[colon_position + 1:]
+                else:
+                    transformed_string = "<strong>" + text[:colon_position + 1] + "</strong>" +'<br>' + text[colon_position + 1:]
         else:
             # If there's no ": ", return the original string
             transformed_string = text
@@ -67,8 +102,11 @@ def unique_strings(input_list: List[str]) -> List[str]:
             seen.add(item)
     return unique_list
 
-
-def convert_to_markdown(output_data: dict, gfm_supported: bool = True, incremental_review=None) -> str:
+def convert_to_markdown_v2(output_data: dict,
+                           gfm_supported: bool = True,
+                           incremental_review=None,
+                           git_provider=None,
+                           files=None) -> str:
     """
     Convert a dictionary of data into markdown format.
     Args:
@@ -79,8 +117,8 @@ def convert_to_markdown(output_data: dict, gfm_supported: bool = True, increment
 
     emojis = {
         "Can be split": "🔀",
-        "Possible issues": "⚡",
         "Key issues to review": "⚡",
+        "Recommended focus areas for review": "⚡",
         "Score": "🏅",
         "Relevant tests": "🧪",
         "Focused PR": "✨",
@@ -89,6 +127,7 @@ def convert_to_markdown(output_data: dict, gfm_supported: bool = True, increment
         "Insights from user's answers": "📝",
         "Code feedback": "🤖",
         "Estimated effort to review [1-5]": "⏱️",
+        "Ticket compliance check": "🎫",
     }
     markdown_text = ""
     if not incremental_review:
@@ -96,76 +135,278 @@ def convert_to_markdown(output_data: dict, gfm_supported: bool = True, increment
     else:
         markdown_text += f"{PRReviewHeader.INCREMENTAL.value} 🔍\n\n"
         markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
-    if gfm_supported:
-        markdown_text += "<table>\n"
-        # markdown_text += """<td> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Feedback&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td> <td></td></tr>"""
-
     if not output_data or not output_data.get('review', {}):
         return ""
 
+    if get_settings().get("pr_reviewer.enable_intro_text", False):
+        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+
+    if gfm_supported:
+        markdown_text += "<table>\n"
+
     for key, value in output_data['review'].items():
         if value is None or value == '' or value == {} or value == []:
-            if key.lower() != 'can_be_split':
+            if key.lower() not in ['can_be_split', 'key_issues_to_review']:
                 continue
         key_nice = key.replace('_', ' ').capitalize()
         emoji = emojis.get(key_nice, "")
-        if gfm_supported:
-            if 'Estimated effort to review' in key_nice:
-                key_nice = 'Estimated&nbsp;effort&nbsp;to&nbsp;review [1-5]'
-            if 'security concerns' in key_nice.lower():
-                value = emphasize_header(value.strip())
-                markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n{value}\n\n</td></tr>\n"
-            elif 'can be split' in key_nice.lower():
-                markdown_text += process_can_be_split(emoji, value)
-            elif 'key issues to review' in key_nice.lower():
-                value = value.strip()
-                issues = value.split('\n- ')
-                for i, _ in enumerate(issues):
-                    issues[i] = issues[i].strip().strip('-').strip()
-                issues = unique_strings(issues) # remove duplicates
-                number_of_issues = len(issues)
-                if number_of_issues > 1:
-                    markdown_text += f"<tr><td rowspan={number_of_issues}> {emoji}&nbsp;<strong>{key_nice}</strong></td>\n"
-                    for i, issue in enumerate(issues):
-                        if not issue:
-                            continue
-                        issue = emphasize_header(issue)
-                        issue = replace_code_tags(issue)
-                        if i == 0:
-                            markdown_text += f"<td>\n{issue}</td></tr>\n"
-                        else:
-                            markdown_text += f"<tr>\n<td>\n{issue}</td></tr>\n"
+        if 'Estimated effort to review' in key_nice:
+            key_nice = 'Estimated effort to review'
+            value = str(value).strip()
+            if value.isnumeric():
+                value_int = int(value)
+            else:
+                try:
+                    value_int = int(value.split(',')[0])
+                except ValueError:
+                    continue
+            blue_bars = '🔵' * value_int
+            white_bars = '⚪' * (5 - value_int)
+            value = f"{value_int} {blue_bars}{white_bars}"
+            if gfm_supported:
+                markdown_text += f"<tr><td>"
+                markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
+                markdown_text += f"</td></tr>\n"
+            else:
+                markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
+        elif 'relevant tests' in key_nice.lower():
+            value = str(value).strip().lower()
+            if gfm_supported:
+                markdown_text += f"<tr><td>"
+                if is_value_no(value):
+                    markdown_text += f"{emoji}&nbsp;<strong>No relevant tests</strong>"
                 else:
-                    value = emphasize_header(value.strip('-').strip())
-                    value = replace_code_tags(value)
-                    markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n{value}\n\n</td></tr>\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>PR contains tests</strong>"
+                markdown_text += f"</td></tr>\n"
             else:
-                markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n{value}\n\n</td></tr>\n"
+                if is_value_no(value):
+                    markdown_text += f'### {emoji} No relevant tests\n\n'
+                else:
+                    markdown_text += f"### {emoji} PR contains tests\n\n"
+        elif 'ticket compliance check' in key_nice.lower():
+            markdown_text = ticket_markdown_logic(emoji, markdown_text, value, gfm_supported)
+        elif 'security concerns' in key_nice.lower():
+            if gfm_supported:
+                markdown_text += f"<tr><td>"
+                if is_value_no(value):
+                    markdown_text += f"{emoji}&nbsp;<strong>No security concerns identified</strong>"
+                else:
+                    markdown_text += f"{emoji}&nbsp;<strong>Security concerns</strong><br><br>\n\n"
+                    value = emphasize_header(value.strip())
+                    markdown_text += f"{value}"
+                markdown_text += f"</td></tr>\n"
+            else:
+                if is_value_no(value):
+                    markdown_text += f'### {emoji} No security concerns identified\n\n'
+                else:
+                    markdown_text += f"### {emoji} Security concerns\n\n"
+                    value = emphasize_header(value.strip(), only_markdown=True)
+                    markdown_text += f"{value}\n\n"
+        elif 'can be split' in key_nice.lower():
+            if gfm_supported:
+                markdown_text += f"<tr><td>"
+                markdown_text += process_can_be_split(emoji, value)
+                markdown_text += f"</td></tr>\n"
+        elif 'key issues to review' in key_nice.lower():
+            # value is a list of issues
+            if is_value_no(value):
+                if gfm_supported:
+                    markdown_text += f"<tr><td>"
+                    markdown_text += f"{emoji}&nbsp;<strong>No major issues detected</strong>"
+                    markdown_text += f"</td></tr>\n"
+                else:
+                    markdown_text += f"### {emoji} No major issues detected\n\n"
+            else:
+                issues = value
+                if gfm_supported:
+                    markdown_text += f"<tr><td>"
+                    # markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong><br><br>\n\n"
+                    markdown_text += f"{emoji}&nbsp;<strong>Recommended focus areas for review</strong><br><br>\n\n"
+                else:
+                    markdown_text += f"### {emoji} Recommended focus areas for review\n\n#### \n"
+                for i, issue in enumerate(issues):
+                    try:
+                        if not issue or not isinstance(issue, dict):
+                            continue
+                        relevant_file = issue.get('relevant_file', '').strip()
+                        issue_header = issue.get('issue_header', '').strip()
+                        if issue_header.lower() == 'possible bug':
+                            issue_header = 'Possible Issue'  # Make the header less frightening
+                        issue_content = issue.get('issue_content', '').strip()
+                        start_line = int(str(issue.get('start_line', 0)).strip())
+                        end_line = int(str(issue.get('end_line', 0)).strip())
+
+                        relevant_lines_str = extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=True)
+                        if git_provider:
+                            reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
+                        else:
+                            reference_link = None
+
+                        if gfm_supported:
+                            if reference_link is not None and len(reference_link) > 0:
+                                if relevant_lines_str:
+                                    issue_str = f"<details><summary><a href='{reference_link}'><strong>{issue_header}</strong></a>\n\n{issue_content}</summary>\n\n{relevant_lines_str}\n\n</details>"
+                                else:
+                                    issue_str = f"<a href='{reference_link}'><strong>{issue_header}</strong></a><br>{issue_content}"
+                            else:
+                                issue_str = f"<strong>{issue_header}</strong><br>{issue_content}"
+                        else:
+                            if reference_link is not None and len(reference_link) > 0:
+                                issue_str = f"[**{issue_header}**]({reference_link})\n\n{issue_content}\n\n"
+                            else:
+                                issue_str = f"**{issue_header}**\n\n{issue_content}\n\n"
+                        markdown_text += f"{issue_str}\n\n"
+                    except Exception as e:
+                        get_logger().exception(f"Failed to process 'Recommended focus areas for review': {e}")
+                if gfm_supported:
+                    markdown_text += f"</td></tr>\n"
         else:
-            if len(value.split()) > 1:
-                markdown_text += f"{emoji} **{key_nice}:**\n\n {value}\n\n"
+            if gfm_supported:
+                markdown_text += f"<tr><td>"
+                markdown_text += f"{emoji}&nbsp;<strong>{key_nice}</strong>: {value}"
+                markdown_text += f"</td></tr>\n"
             else:
-                markdown_text += f"{emoji} **{key_nice}:** {value}\n\n"
+                markdown_text += f"### {emoji} {key_nice}: {value}\n\n"
+
     if gfm_supported:
         markdown_text += "</table>\n"
 
-    if 'code_feedback' in output_data:
-        if gfm_supported:
-            markdown_text += f"\n\n"
-            markdown_text += f"<details><summary> <strong>Code feedback:</strong></summary>\n\n"
-            markdown_text += "<hr>"
-        else:
-            markdown_text += f"\n\n** Code feedback:**\n\n"
-        for i, value in enumerate(output_data['code_feedback']):
-            if value is None or value == '' or value == {} or value == []:
-                continue
-            markdown_text += parse_code_suggestion(value, i, gfm_supported)+"\n\n"
-        if markdown_text.endswith('<hr>'):
-            markdown_text = markdown_text[:-4]
-        if gfm_supported:
-            markdown_text += f"</details>"
-    #print(markdown_text)
+    return markdown_text
 
+
+def extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=False) -> str:
+    """
+    Finds 'relevant_file' in 'files', and extracts the lines from 'start_line' to 'end_line' string from the file content.
+    """
+    try:
+        relevant_lines_str = ""
+        if files:
+            files = set_file_languages(files)
+            for file in files:
+                if file.filename.strip() == relevant_file:
+                    if not file.head_file:
+                        # as a fallback, extract relevant lines directly from patch
+                        patch = file.patch
+                        get_logger().info(f"No content found in file: '{file.filename}' for 'extract_relevant_lines_str'. Using patch instead")
+                        _, selected_lines = extract_hunk_lines_from_patch(patch, file.filename, start_line, end_line,side='right')
+                        if not selected_lines:
+                            get_logger().error(f"Failed to extract relevant lines from patch: {file.filename}")
+                            return ""
+                        # filter out '-' lines
+                        relevant_lines_str = ""
+                        for line in selected_lines.splitlines():
+                            if line.startswith('-'):
+                                continue
+                            relevant_lines_str += line[1:] + '\n'
+                    else:
+                        relevant_file_lines = file.head_file.splitlines()
+                        relevant_lines_str = "\n".join(relevant_file_lines[start_line - 1:end_line])
+
+                    if dedent and relevant_lines_str:
+                        # Remove the longest leading string of spaces and tabs common to all lines.
+                        relevant_lines_str = textwrap.dedent(relevant_lines_str)
+                    relevant_lines_str = f"```{file.language}\n{relevant_lines_str}\n```"
+                    break
+
+        return relevant_lines_str
+    except Exception as e:
+        get_logger().exception(f"Failed to extract relevant lines: {e}")
+        return ""
+
+
+def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
+    ticket_compliance_str = ""
+    compliance_emoji = ''
+    # Track compliance levels across all tickets
+    all_compliance_levels = []
+
+    if isinstance(value, list):
+        for ticket_analysis in value:
+            try:
+                ticket_url = ticket_analysis.get('ticket_url', '').strip()
+                explanation = ''
+                ticket_compliance_level = ''  # Individual ticket compliance
+                fully_compliant_str = ticket_analysis.get('fully_compliant_requirements', '').strip()
+                not_compliant_str = ticket_analysis.get('not_compliant_requirements', '').strip()
+                requires_further_human_verification = ticket_analysis.get('requires_further_human_verification',
+                                                                          '').strip()
+
+                if not fully_compliant_str and not not_compliant_str:
+                    get_logger().debug(f"Ticket compliance has no requirements",
+                                       artifact={'ticket_url': ticket_url})
+                    continue
+
+                # Calculate individual ticket compliance level
+                if fully_compliant_str:
+                    if not_compliant_str:
+                        ticket_compliance_level = 'Partially compliant'
+                    else:
+                        if not requires_further_human_verification:
+                            ticket_compliance_level = 'Fully compliant'
+                        else:
+                            ticket_compliance_level = 'PR Code Verified'
+                elif not_compliant_str:
+                    ticket_compliance_level = 'Not compliant'
+
+                # Store the compliance level for aggregation
+                if ticket_compliance_level:
+                    all_compliance_levels.append(ticket_compliance_level)
+
+                # build compliance string
+                if fully_compliant_str:
+                    explanation += f"Compliant requirements:\n\n{fully_compliant_str}\n\n"
+                if not_compliant_str:
+                    explanation += f"Non-compliant requirements:\n\n{not_compliant_str}\n\n"
+                if requires_further_human_verification:
+                    explanation += f"Requires further human verification:\n\n{requires_further_human_verification}\n\n"
+                ticket_compliance_str += f"\n\n**[{ticket_url.split('/')[-1]}]({ticket_url}) - {ticket_compliance_level}**\n\n{explanation}\n\n"
+
+                # for debugging
+                if requires_further_human_verification:
+                    get_logger().debug(f"Ticket compliance requires further human verification",
+                                       artifact={'ticket_url': ticket_url,
+                                                 'requires_further_human_verification': requires_further_human_verification,
+                                                 'compliance_level': ticket_compliance_level})
+
+            except Exception as e:
+                get_logger().exception(f"Failed to process ticket compliance: {e}")
+                continue
+
+        # Calculate overall compliance level and emoji
+        if all_compliance_levels:
+            if all(level == 'Fully compliant' for level in all_compliance_levels):
+                compliance_level = 'Fully compliant'
+                compliance_emoji = '✅'
+            elif all(level == 'PR Code Verified' for level in all_compliance_levels):
+                compliance_level = 'PR Code Verified'
+                compliance_emoji = '✅'
+            elif any(level == 'Not compliant' for level in all_compliance_levels):
+                # If there's a mix of compliant and non-compliant tickets
+                if any(level in ['Fully compliant', 'PR Code Verified'] for level in all_compliance_levels):
+                    compliance_level = 'Partially compliant'
+                    compliance_emoji = '🔶'
+                else:
+                    compliance_level = 'Not compliant'
+                    compliance_emoji = '❌'
+            elif any(level == 'Partially compliant' for level in all_compliance_levels):
+                compliance_level = 'Partially compliant'
+                compliance_emoji = '🔶'
+            else:
+                compliance_level = 'PR Code Verified'
+                compliance_emoji = '✅'
+
+            # Set extra statistics outside the ticket loop
+            get_settings().set('config.extra_statistics', {'compliance_level': compliance_level})
+
+        # editing table row for ticket compliance analysis
+        if gfm_supported:
+            markdown_text += f"<tr><td>\n\n"
+            markdown_text += f"**{emoji} Ticket compliance analysis {compliance_emoji}**\n\n"
+            markdown_text += ticket_compliance_str
+            markdown_text += f"</td></tr>\n"
+        else:
+            markdown_text += f"### {emoji} Ticket compliance analysis {compliance_emoji}\n\n"
+            markdown_text += ticket_compliance_str + "\n\n"
 
     return markdown_text
 
@@ -177,29 +418,47 @@ def process_can_be_split(emoji, value):
         markdown_text = ""
         if not value or isinstance(value, list) and len(value) == 1:
             value = "No"
-            markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n\n{value}\n\n</td></tr>\n"
+            # markdown_text += f"<tr><td> {emoji}&nbsp;<strong>{key_nice}</strong></td><td>\n\n{value}\n\n</td></tr>\n"
+            # markdown_text += f"### {emoji} No multiple PR themes\n\n"
+            markdown_text += f"{emoji} <strong>No multiple PR themes</strong>\n\n"
         else:
-            number_of_splits = len(value)
-            markdown_text += f"<tr><td rowspan={number_of_splits}> {emoji}&nbsp;<strong>{key_nice}</strong></td>\n"
+            markdown_text += f"{emoji} <strong>{key_nice}</strong><br><br>\n\n"
             for i, split in enumerate(value):
                 title = split.get('title', '')
                 relevant_files = split.get('relevant_files', [])
-                if i == 0:
-                    markdown_text += f"<td><details><summary>\nSub-PR theme:<br><strong>{title}</strong></summary>\n\n"
-                    markdown_text += f"<hr>\n"
-                    markdown_text += f"Relevant files:\n"
-                    markdown_text += f"<ul>\n"
-                    for file in relevant_files:
-                        markdown_text += f"<li>{file}</li>\n"
-                    markdown_text += f"</ul>\n\n</details></td></tr>\n"
-                else:
-                    markdown_text += f"<tr>\n<td><details><summary>\nSub-PR theme:<br><strong>{title}</strong></summary>\n\n"
-                    markdown_text += f"<hr>\n"
-                    markdown_text += f"Relevant files:\n"
-                    markdown_text += f"<ul>\n"
-                    for file in relevant_files:
-                        markdown_text += f"<li>{file}</li>\n"
-                    markdown_text += f"</ul>\n\n</details></td></tr>\n"
+                markdown_text += f"<details><summary>\nSub-PR theme: <b>{title}</b></summary>\n\n"
+                markdown_text += f"___\n\nRelevant files:\n\n"
+                for file in relevant_files:
+                    markdown_text += f"- {file}\n"
+                markdown_text += f"___\n\n"
+                markdown_text += f"</details>\n\n"
+
+                # markdown_text += f"#### Sub-PR theme: {title}\n\n"
+                # markdown_text += f"Relevant files:\n\n"
+                # for file in relevant_files:
+                #     markdown_text += f"- {file}\n"
+                # markdown_text += "\n"
+            # number_of_splits = len(value)
+            # markdown_text += f"<tr><td rowspan={number_of_splits}> {emoji}&nbsp;<strong>{key_nice}</strong></td>\n"
+            # for i, split in enumerate(value):
+            #     title = split.get('title', '')
+            #     relevant_files = split.get('relevant_files', [])
+            #     if i == 0:
+            #         markdown_text += f"<td><details><summary>\nSub-PR theme:<br><strong>{title}</strong></summary>\n\n"
+            #         markdown_text += f"<hr>\n"
+            #         markdown_text += f"Relevant files:\n"
+            #         markdown_text += f"<ul>\n"
+            #         for file in relevant_files:
+            #             markdown_text += f"<li>{file}</li>\n"
+            #         markdown_text += f"</ul>\n\n</details></td></tr>\n"
+            #     else:
+            #         markdown_text += f"<tr>\n<td><details><summary>\nSub-PR theme:<br><strong>{title}</strong></summary>\n\n"
+            #         markdown_text += f"<hr>\n"
+            #         markdown_text += f"Relevant files:\n"
+            #         markdown_text += f"<ul>\n"
+            #         for file in relevant_files:
+            #             markdown_text += f"<li>{file}</li>\n"
+            #         markdown_text += f"</ul>\n\n</details></td></tr>\n"
     except Exception as e:
         get_logger().exception(f"Failed to process can be split: {e}")
         return ""
@@ -375,27 +634,22 @@ def load_large_diff(filename, new_file_content_str: str, original_file_content_s
     """
     Generate a patch for a modified file by comparing the original content of the file with the new content provided as
     input.
-
-    Args:
-        new_file_content_str: The new content of the file as a string.
-        original_file_content_str: The original content of the file as a string.
-
-    Returns:
-        The generated or provided patch string.
-
-    Raises:
-        None.
     """
-    patch = ""
+    if not original_file_content_str and not new_file_content_str:
+        return ""
+
     try:
+        original_file_content_str = (original_file_content_str or "").rstrip() + "\n"
+        new_file_content_str = (new_file_content_str or "").rstrip() + "\n"
         diff = difflib.unified_diff(original_file_content_str.splitlines(keepends=True),
                                     new_file_content_str.splitlines(keepends=True))
         if get_settings().config.verbosity_level >= 2 and show_warning:
-            get_logger().warning(f"File was modified, but no patch was found. Manually creating patch: {filename}.")
+            get_logger().info(f"File was modified, but no patch was found. Manually creating patch: {filename}.")
         patch = ''.join(diff)
-    except Exception:
-        pass
-    return patch
+        return patch
+    except Exception as e:
+        get_logger().exception(f"Failed to generate patch for file: {filename}")
+        return ""
 
 
 def update_settings_from_args(args: List[str]) -> List[str]:
@@ -444,34 +698,44 @@ def _fix_key_value(key: str, value: str):
     return key, value
 
 
-def load_yaml(response_text: str, keys_fix_yaml: List[str] = []) -> dict:
-    response_text = response_text.removeprefix('```yaml').rstrip('`')
+def load_yaml(response_text: str, keys_fix_yaml: List[str] = [], first_key="", last_key="") -> dict:
+    response_text = response_text.strip('\n').removeprefix('```yaml').rstrip().removesuffix('```')
     try:
         data = yaml.safe_load(response_text)
     except Exception as e:
-        get_logger().error(f"Failed to parse AI prediction: {e}")
-        data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml)
+        get_logger().warning(f"Initial failure to parse AI prediction: {e}")
+        data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key)
+        if not data:
+            get_logger().error(f"Failed to parse AI prediction after fallbacks",
+                               artifact={'response_text': response_text})
+        else:
+            get_logger().info(f"Successfully parsed AI prediction after fallbacks",
+                              artifact={'response_text': response_text})
     return data
 
 
-def try_fix_yaml(response_text: str, keys_fix_yaml: List[str] = []) -> dict:
+
+def try_fix_yaml(response_text: str,
+                 keys_fix_yaml: List[str] = [],
+                 first_key="",
+                 last_key="",) -> dict:
     response_text_lines = response_text.split('\n')
 
-    keys = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:', 'improved code:']
-    keys = keys + keys_fix_yaml
+    keys_yaml = ['relevant line:', 'suggestion content:', 'relevant file:', 'existing code:', 'improved code:']
+    keys_yaml = keys_yaml + keys_fix_yaml
     # first fallback - try to convert 'relevant line: ...' to relevant line: |-\n        ...'
     response_text_lines_copy = response_text_lines.copy()
     for i in range(0, len(response_text_lines_copy)):
-        for key in keys:
-            if key in response_text_lines_copy[i] and not '|-' in response_text_lines_copy[i]:
+        for key in keys_yaml:
+            if key in response_text_lines_copy[i] and not '|' in response_text_lines_copy[i]:
                 response_text_lines_copy[i] = response_text_lines_copy[i].replace(f'{key}',
-                                                                                  f'{key} |-\n        ')
+                                                                                  f'{key} |\n        ')
     try:
         data = yaml.safe_load('\n'.join(response_text_lines_copy))
         get_logger().info(f"Successfully parsed AI prediction after adding |-\n")
         return data
     except:
-        get_logger().info(f"Failed to parse AI prediction after adding |-\n")
+        pass
 
     # second fallback - try to extract only range from first ```yaml to ````
     snippet_pattern = r'```(yaml)?[\s\S]*?```'
@@ -495,8 +759,38 @@ def try_fix_yaml(response_text: str, keys_fix_yaml: List[str] = []) -> dict:
     except:
         pass
 
-    # fourth fallback - try to remove last lines
-    data = {}
+
+    # forth fallback - try to extract yaml snippet by 'first_key' and 'last_key'
+    # note that 'last_key' can be in practice a key that is not the last key in the yaml snippet.
+    # it just needs to be some inner key, so we can look for newlines after it
+    if first_key and last_key:
+        index_start = response_text.find(f"\n{first_key}:")
+        if index_start == -1:
+            index_start = response_text.find(f"{first_key}:")
+        index_last_code = response_text.rfind(f"{last_key}:")
+        index_end = response_text.find("\n\n", index_last_code) # look for newlines after last_key
+        if index_end == -1:
+            index_end = len(response_text)
+        response_text_copy = response_text[index_start:index_end].strip().strip('```yaml').strip('`').strip()
+        try:
+            data = yaml.safe_load(response_text_copy)
+            get_logger().info(f"Successfully parsed AI prediction after extracting yaml snippet")
+            return data
+        except:
+            pass
+
+    # fifth fallback - try to remove leading '+' (sometimes added by AI for 'existing code' and 'improved code')
+    response_text_lines_copy = response_text_lines.copy()
+    for i in range(0, len(response_text_lines_copy)):
+        response_text_lines_copy[i] = ' ' + response_text_lines_copy[i][1:]
+    try:
+        data = yaml.safe_load('\n'.join(response_text_lines_copy))
+        get_logger().info(f"Successfully parsed AI prediction after removing leading '+'")
+        return data
+    except:
+        pass
+
+    # sixth fallback - try to remove last lines
     for i in range(1, len(response_text_lines)):
         response_text_lines_tmp = '\n'.join(response_text_lines[:-i])
         try:
@@ -537,14 +831,16 @@ def get_user_labels(current_labels: List[str] = None):
     Only keep labels that has been added by the user
     """
     try:
+        enable_custom_labels = get_settings().config.get('enable_custom_labels', False)
+        custom_labels = get_settings().get('custom_labels', [])
         if current_labels is None:
             current_labels = []
         user_labels = []
         for label in current_labels:
             if label.lower() in ['bug fix', 'tests', 'enhancement', 'documentation', 'other']:
                 continue
-            if get_settings().config.enable_custom_labels:
-                if label in get_settings().custom_labels:
+            if enable_custom_labels:
+                if label in custom_labels:
                     continue
             user_labels.append(label)
         if user_labels:
@@ -556,16 +852,26 @@ def get_user_labels(current_labels: List[str] = None):
 
 
 def get_max_tokens(model):
+    """
+    Get the maximum number of tokens allowed for a model.
+    logic:
+    (1) If the model is in './pr_agent/algo/__init__.py', use the value from there.
+    (2) else, the user needs to define explicitly 'config.custom_model_max_tokens'
+
+    For both cases, we further limit the number of tokens to 'config.max_model_tokens' if it is set.
+    This aims to improve the algorithmic quality, as the AI model degrades in performance when the input is too long.
+    """
     settings = get_settings()
     if model in MAX_TOKENS:
         max_tokens_model = MAX_TOKENS[model]
+    elif settings.config.custom_model_max_tokens > 0:
+        max_tokens_model = settings.config.custom_model_max_tokens
     else:
         return 100000
         #raise Exception(f"MAX_TOKENS must be set for model {model} in ./pr_agent/algo/__init__.py")
 
-    if settings.config.max_model_tokens:
+    if settings.config.max_model_tokens and settings.config.max_model_tokens > 0:
         max_tokens_model = min(settings.config.max_model_tokens, max_tokens_model)
-        # get_logger().debug(f"limiting max tokens to {max_tokens_model}")
     return max_tokens_model
 
 
@@ -617,6 +923,7 @@ def replace_code_tags(text):
     """
     Replace odd instances of ` with <code> and even instances of ` with </code>
     """
+    text = html.escape(text)
     parts = text.split('`')
     for i in range(1, len(parts), 2):
         parts[i] = '<code>' + parts[i] + '</code>'
@@ -632,6 +939,9 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
         absolute_position = -1
     re_hunk_header = re.compile(
         r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[ ]?(.*)")
+
+    if not diff_files:
+        return position, absolute_position
 
     for file in diff_files:
         if file.filename and (file.filename.strip() == relevant_file):
@@ -694,56 +1004,64 @@ def find_line_number_of_relevant_line_in_file(diff_files: List[FilePatchInfo],
                             break
     return position, absolute_position
 
-def validate_and_await_rate_limit(rate_limit_status=None, git_provider=None, get_rate_limit_status_func=None):
-    if git_provider and not rate_limit_status:
-        rate_limit_status = {'resources': git_provider.github_client.get_rate_limit().raw_data}
+def get_rate_limit_status(github_token) -> dict:
+    GITHUB_API_URL = get_settings(use_context=False).get("GITHUB.BASE_URL", "https://api.github.com").rstrip("/")  # "https://api.github.com"
+    # GITHUB_API_URL = "https://api.github.com"
+    RATE_LIMIT_URL = f"{GITHUB_API_URL}/rate_limit"
+    HEADERS = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"token {github_token}"
+    }
 
-    if not rate_limit_status:
-        rate_limit_status = get_rate_limit_status_func()
+    response = requests.get(RATE_LIMIT_URL, headers=HEADERS)
+    try:
+        rate_limit_info = response.json()
+        if rate_limit_info.get('message') == 'Rate limiting is not enabled.':  # for github enterprise
+            return {'resources': {}}
+        response.raise_for_status()  # Check for HTTP errors
+    except:  # retry
+        time.sleep(0.1)
+        response = requests.get(RATE_LIMIT_URL, headers=HEADERS)
+        return response.json()
+    return rate_limit_info
+
+
+def validate_rate_limit_github(github_token, installation_id=None, threshold=0.1) -> bool:
+    try:
+        rate_limit_status = get_rate_limit_status(github_token)
+        if installation_id:
+            get_logger().debug(f"installation_id: {installation_id}, Rate limit status: {rate_limit_status['rate']}")
     # validate that the rate limit is not exceeded
-    is_rate_limit = False
-    for key, value in rate_limit_status['resources'].items():
-        if value['remaining'] == 0:
-            print(f"key: {key}, value: {value}")
-            is_rate_limit = True
-            sleep_time_sec = value['reset'] - datetime.now().timestamp()
-            sleep_time_hour = sleep_time_sec / 3600.0
-            print(f"Rate limit exceeded. Sleeping for {sleep_time_hour} hours")
-            if sleep_time_sec > 0:
-                time.sleep(sleep_time_sec+1)
-
-            if git_provider:
-                rate_limit_status = {'resources': git_provider.github_client.get_rate_limit().raw_data}
-            else:
-                rate_limit_status = get_rate_limit_status_func()
-
-    return is_rate_limit
+        # validate that the rate limit is not exceeded
+        for key, value in rate_limit_status['resources'].items():
+            if value['remaining'] < value['limit'] * threshold:
+                get_logger().error(f"key: {key}, value: {value}")
+                return False
+        return True
+    except Exception as e:
+        get_logger().error(f"Error in rate limit {e}",
+                           artifact={"traceback": traceback.format_exc()})
+        return True
 
 
-def get_largest_component(pr_url):
-    from pr_agent.tools.pr_analyzer import PRAnalyzer
-    publish_output = get_settings().config.publish_output
-    get_settings().config.publish_output = False  # disable publish output
-    analyzer = PRAnalyzer(pr_url)
-    methods_dict_files = analyzer.run_sync()
-    get_settings().config.publish_output = publish_output
-    max_lines_changed = 0
-    file_b = ""
-    component_name_b = ""
-    for file in methods_dict_files:
-        for method in methods_dict_files[file]:
-            try:
-                if methods_dict_files[file][method]['num_plus_lines'] > max_lines_changed:
-                    max_lines_changed = methods_dict_files[file][method]['num_plus_lines']
-                    file_b = file
-                    component_name_b = method
-            except:
-                pass
-    if component_name_b:
-        get_logger().info(f"Using the largest changed component: '{component_name_b}'")
-        return component_name_b, file_b
-    else:
-        return None, None
+def validate_and_await_rate_limit(github_token):
+    try:
+        rate_limit_status = get_rate_limit_status(github_token)
+        # validate that the rate limit is not exceeded
+        for key, value in rate_limit_status['resources'].items():
+            if value['remaining'] < value['limit'] // 80:
+                get_logger().error(f"key: {key}, value: {value}")
+                sleep_time_sec = value['reset'] - datetime.now().timestamp()
+                sleep_time_hour = sleep_time_sec / 3600.0
+                get_logger().error(f"Rate limit exceeded. Sleeping for {sleep_time_hour} hours")
+                if sleep_time_sec > 0:
+                    time.sleep(sleep_time_sec + 1)
+                rate_limit_status = get_rate_limit_status(github_token)
+        return rate_limit_status
+    except:
+        get_logger().error("Error in rate limit")
+        return None
+
 
 def github_action_output(output_data: dict, key_name: str):
     try:
@@ -759,23 +1077,173 @@ def github_action_output(output_data: dict, key_name: str):
 
 
 def show_relevant_configurations(relevant_section: str) -> str:
-    forbidden_keys = ['ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider',
+    skip_keys = ['ai_disclaimer', 'ai_disclaimer_title', 'ANALYTICS_FOLDER', 'secret_provider', "skip_keys", "app_id", "redirect",
                       'trial_prefix_message', 'no_eligible_message', 'identity_provider', 'ALLOWED_REPOS','APP_NAME']
+    extra_skip_keys = get_settings().config.get('config.skip_keys', [])
+    if extra_skip_keys:
+        skip_keys.extend(extra_skip_keys)
 
     markdown_text = ""
     markdown_text += "\n<hr>\n<details> <summary><strong>🛠️ Relevant configurations:</strong></summary> \n\n"
     markdown_text +="<br>These are the relevant [configurations](https://github.com/Codium-ai/pr-agent/blob/main/pr_agent/settings/configuration.toml) for this tool:\n\n"
     markdown_text += f"**[config**]\n```yaml\n\n"
     for key, value in get_settings().config.items():
-        if key in forbidden_keys:
+        if key in skip_keys:
             continue
         markdown_text += f"{key}: {value}\n"
     markdown_text += "\n```\n"
     markdown_text += f"\n**[{relevant_section}]**\n```yaml\n\n"
     for key, value in get_settings().get(relevant_section, {}).items():
-        if key in forbidden_keys:
+        if key in skip_keys:
             continue
         markdown_text += f"{key}: {value}\n"
     markdown_text += "\n```"
     markdown_text += "\n</details>\n"
     return markdown_text
+
+def is_value_no(value):
+    if not value:
+        return True
+    value_str = str(value).strip().lower()
+    if value_str == 'no' or value_str == 'none' or value_str == 'false':
+        return True
+    return False
+
+
+def set_pr_string(repo_name, pr_number):
+    return f"{repo_name}#{pr_number}"
+
+
+def string_to_uniform_number(s: str) -> float:
+    """
+    Convert a string to a uniform number in the range [0, 1].
+    The uniform distribution is achieved by the nature of the SHA-256 hash function, which produces a uniformly distributed hash value over its output space.
+    """
+    # Generate a hash of the string
+    hash_object = hashlib.sha256(s.encode())
+    # Convert the hash to an integer
+    hash_int = int(hash_object.hexdigest(), 16)
+    # Normalize the integer to the range [0, 1]
+    max_hash_int = 2 ** 256 - 1
+    uniform_number = float(hash_int) / max_hash_int
+    return uniform_number
+
+
+def process_description(description_full: str) -> Tuple[str, List]:
+    if not description_full:
+        return "", []
+
+    description_split = description_full.split(PRDescriptionHeader.CHANGES_WALKTHROUGH.value)
+    base_description_str = description_split[0]
+    changes_walkthrough_str = ""
+    files = []
+    if len(description_split) > 1:
+        changes_walkthrough_str = description_split[1]
+    else:
+        get_logger().debug("No changes walkthrough found")
+
+    try:
+        if changes_walkthrough_str:
+            # get the end of the table
+            if '</table>\n\n___' in changes_walkthrough_str:
+                end = changes_walkthrough_str.index("</table>\n\n___")
+            elif '\n___' in changes_walkthrough_str:
+                end = changes_walkthrough_str.index("\n___")
+            else:
+                end = len(changes_walkthrough_str)
+            changes_walkthrough_str = changes_walkthrough_str[:end]
+
+            h = html2text.HTML2Text()
+            h.body_width = 0  # Disable line wrapping
+
+            # find all the files
+            pattern = r'<tr>\s*<td>\s*(<details>\s*<summary>(.*?)</summary>(.*?)</details>)\s*</td>'
+            files_found = re.findall(pattern, changes_walkthrough_str, re.DOTALL)
+            for file_data in files_found:
+                try:
+                    if isinstance(file_data, tuple):
+                        file_data = file_data[0]
+                    pattern = r'<details>\s*<summary><strong>(.*?)</strong>\s*<dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\s*<li>(.*?)</details>'
+                    res = re.search(pattern, file_data, re.DOTALL)
+                    if not res or res.lastindex != 4:
+                        pattern_back = r'<details>\s*<summary><strong>(.*?)</strong><dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\n\n\s*(.*?)</details>'
+                        res = re.search(pattern_back, file_data, re.DOTALL)
+                    if not res or res.lastindex != 4:
+                        pattern_back = r'<details>\s*<summary><strong>(.*?)</strong>\s*<dd><code>(.*?)</code>.*?</summary>\s*<hr>\s*(.*?)\s*-\s*(.*?)\s*</details>' # looking for hypen ('- ')
+                        res = re.search(pattern_back, file_data, re.DOTALL)
+                    if res and res.lastindex == 4:
+                        short_filename = res.group(1).strip()
+                        short_summary = res.group(2).strip()
+                        long_filename = res.group(3).strip()
+                        long_summary =  res.group(4).strip()
+                        long_summary = long_summary.replace('<br> *', '\n*').replace('<br>','').replace('\n','<br>')
+                        long_summary = h.handle(long_summary).strip()
+                        if long_summary.startswith('\\-'):
+                            long_summary = "* " + long_summary[2:]
+                        elif not long_summary.startswith('*'):
+                            long_summary = f"* {long_summary}"
+
+                        files.append({
+                            'short_file_name': short_filename,
+                            'full_file_name': long_filename,
+                            'short_summary': short_summary,
+                            'long_summary': long_summary
+                        })
+                    else:
+                        if '<code>...</code>' in file_data:
+                            pass # PR with many files. some did not get analyzed
+                        else:
+                            get_logger().error(f"Failed to parse description", artifact={'description': file_data})
+                except Exception as e:
+                    get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
+
+
+    except Exception as e:
+        get_logger().exception(f"Failed to process description: {e}")
+
+    return base_description_str, files
+
+def get_version() -> str:
+    # First check pyproject.toml if running directly out of repository
+    if os.path.exists("pyproject.toml"):
+        if sys.version_info >= (3, 11):
+            import tomllib
+            with open("pyproject.toml", "rb") as f:
+                data = tomllib.load(f)
+                if "project" in data and "version" in data["project"]:
+                    return data["project"]["version"]
+                else:
+                    get_logger().warning("Version not found in pyproject.toml")
+        else:
+            get_logger().warning("Unable to determine local version from pyproject.toml")
+
+    # Otherwise get the installed pip package version
+    try:
+        return version('pr-agent')
+    except PackageNotFoundError:
+        get_logger().warning("Unable to find package named 'pr-agent'")
+        return "unknown"
+
+
+def set_file_languages(diff_files) -> List[FilePatchInfo]:
+    try:
+        # if the language is already set, do not change it
+        if hasattr(diff_files[0], 'language') and diff_files[0].language:
+            return diff_files
+
+        # map file extensions to programming languages
+        language_extension_map_org = get_settings().language_extension_map_org
+        extension_to_language = {}
+        for language, extensions in language_extension_map_org.items():
+            for ext in extensions:
+                extension_to_language[ext] = language
+        for file in diff_files:
+            extension_s = '.' + file.filename.rsplit('.')[-1]
+            language_name = "txt"
+            if extension_s and (extension_s in extension_to_language):
+                language_name = extension_to_language[extension_s]
+            file.language = language_name.lower()
+    except Exception as e:
+        get_logger().exception(f"Failed to set file languages: {e}")
+
+    return diff_files

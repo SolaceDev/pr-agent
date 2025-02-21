@@ -1,27 +1,26 @@
-site_name: PR-Agent Documentation
+site_name: Qodo Merge (and open-source PR-Agent)
 repo_url: https://github.com/Codium-ai/pr-agent
 repo_name: Codium-ai/pr-agent
 
 nav:
   - Overview:
     - 'index.md'
-    - 💎 PR-Agent Pro: 'overview/pr_agent_pro.md'
+    - 💎 Qodo Merge: 'overview/pr_agent_pro.md'
     - Data Privacy: 'overview/data_privacy.md'
   - Installation:
     - 'installation/index.md'
-    - Locally: 'installation/locally.md'
-    - GitHub: 'installation/github.md'
-    - GitLab: 'installation/gitlab.md'
-    - BitBucket: 'installation/bitbucket.md'
-    - Azure DevOps: 'installation/azure.md'
-    - 💎 PR-Agent Pro: 'installation/pr_agent_pro.md'
+    - PR-Agent: 'installation/pr_agent.md'
+    - 💎 Qodo Merge: 'installation/qodo_merge.md'
   - Usage Guide:
     - 'usage-guide/index.md'
     - Introduction: 'usage-guide/introduction.md'
-    - Configuration Options: 'usage-guide/configuration_options.md'
-    - Managing Mail Notifications: 'usage-guide/mail_notifications.md'
+    - Enabling a Wiki: 'usage-guide/enabling_a_wiki.md'
+    - Configuration File: 'usage-guide/configuration_options.md'
     - Usage and Automation: 'usage-guide/automations_and_usage.md'
+    - Managing Mail Notifications: 'usage-guide/mail_notifications.md'
+    - Changing a Model: 'usage-guide/changing_a_model.md'
     - Additional Configurations: 'usage-guide/additional_configurations.md'
+    - 💎 Qodo Merge Models: 'usage-guide/qodo_merge_models.md'
   - Tools:
     - 'tools/index.md'
     - Describe: 'tools/describe.md'
@@ -39,9 +38,27 @@ nav:
     - 💎 Custom Prompt: 'tools/custom_prompt.md'
     - 💎 CI Feedback: 'tools/ci_feedback.md'
     - 💎 Similar Code: 'tools/similar_code.md'
-  - Core Abilities: 'core-abilities/index.md'
-  - Chrome Extension: 'chrome-extension/index.md'
-  - Code Fine-tuning Benchmark: 'finetuning_benchmark/index.md'
+    - 💎 Implement: 'tools/implement.md'
+  - Core Abilities:
+      - 'core-abilities/index.md'
+      - Fetching ticket context: 'core-abilities/fetching_ticket_context.md'
+      - Auto best practices: 'core-abilities/auto_best_practices.md'
+      - Local and global metadata: 'core-abilities/metadata.md'
+      - Dynamic context: 'core-abilities/dynamic_context.md'
+      - Self-reflection: 'core-abilities/self_reflection.md'
+      - Impact evaluation: 'core-abilities/impact_evaluation.md'
+      - Interactivity: 'core-abilities/interactivity.md'
+      - Compression strategy: 'core-abilities/compression_strategy.md'
+      - Code-oriented YAML: 'core-abilities/code_oriented_yaml.md'
+      - Static code analysis: 'core-abilities/static_code_analysis.md'
+      - Code Fine-tuning Benchmark: 'finetuning_benchmark/index.md'
+  - Chrome Extension:
+      - Qodo Merge Chrome Extension: 'chrome-extension/index.md'
+      - Features: 'chrome-extension/features.md'
+      - Data Privacy: 'chrome-extension/data_privacy.md'
+  - FAQ:
+      - FAQ: 'faq/index.md'
+#  - Code Fine-tuning Benchmark: 'finetuning_benchmark/index.md'
 
 theme:
   logo: assets/logo.svg
@@ -131,7 +148,7 @@ markdown_extensions:
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - toc:
       title: On this page
-      toc_depth: 2
+      toc_depth: 3
       permalink: true
 
 
